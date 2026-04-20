@@ -1,6 +1,7 @@
 use clap::Parser;
+use ordered_float::OrderedFloat;
 use rayon::slice::ParallelSliceMut;
-use std::cmp::Ordering;
+use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::io::{self, BufRead};
@@ -183,45 +184,27 @@ fn build_lcp_array(sarray: &[Index], tokens: &[Token]) -> Vec<Index> {
     lcp
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct InterestingRange {
-    score: f64,
+    score: OrderedFloat<f64>,
     start: Index,
     end: Index,
 }
 
 impl InterestingRange {
     fn new(score: f64, start: Index, end: Index) -> InterestingRange {
-        InterestingRange { score, start, end }
-    }
-}
-
-impl PartialEq for InterestingRange {
-    fn eq(&self, other: &Self) -> bool {
-        self.score == other.score && self.start == other.start && self.end == other.end
-    }
-}
-
-impl Eq for InterestingRange {}
-
-impl Ord for InterestingRange {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Reverse order for min-heap behavior
-        // Use total_cmp to handle NaN properly (treats NaN as less than all other values)
-        other.score.total_cmp(&self.score)
-    }
-}
-
-impl PartialOrd for InterestingRange {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other)) // or self.cmp(other).into()
+        InterestingRange {
+            score: OrderedFloat(score),
+            start,
+            end,
+        }
     }
 }
 
 // Implement a *min* heap of InterestingRange
 struct InterestingRangeHeap {
     max_size: usize,
-    heap: BinaryHeap<InterestingRange>,
+    heap: BinaryHeap<Reverse<InterestingRange>>,
 }
 
 impl InterestingRangeHeap {
@@ -236,10 +219,10 @@ impl InterestingRangeHeap {
         // and replace the heap's minimum by the new range if the
         // new range is bigger.
         if self.heap.len() < self.max_size {
-            self.heap.push(range);
-        } else if range.score > self.heap.peek().unwrap().score {
+            self.heap.push(Reverse(range));
+        } else if range > self.heap.peek().unwrap().0 {
             self.heap.pop();
-            self.heap.push(range);
+            self.heap.push(Reverse(range));
         }
     }
 }
@@ -372,9 +355,9 @@ fn print_unique_substrings(
     }
 
     // Iterate throught the best tokens by mi2
-    let mut mi2_ranges: Vec<InterestingRange> = best_mi2.heap.drain().collect();
-    // mi2_ranges.sort_by(|a, b| a.cmp(b));
-    mi2_ranges.sort_by(|a, b| (b.end - b.start).cmp(&(a.end - a.start)));
+    let mut mi2_ranges: Vec<InterestingRange> =
+        best_mi2.heap.drain().map(|wrapped| wrapped.0).collect();
+    mi2_ranges.sort_by(|a, b| b.score.cmp(&a.score));
 
     for range in mi2_ranges {
         let suffix_start = sarray[range.start as usize] as usize;
@@ -384,7 +367,7 @@ fn print_unique_substrings(
             .iter()
             .map(|&t| token_decoder[t as usize].as_str())
             .collect();
-        println!("{} ({})", words.join(" "), range.score);
+        println!("{} ({})", words.join(" "), range.score.0);
     }
 }
 
