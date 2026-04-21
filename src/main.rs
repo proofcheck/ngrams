@@ -9,33 +9,6 @@ use std::io::{self, BufRead};
 type Token = u32; // u16;
 type Index = u32;
 
-/// Get the words from a file, lowercased.
-///
-/// Punctuation adjacent to whitespace is removed;
-/// punctuation within a word is kept. So "Huh? don't!" -> "huh" and "don't"
-fn get_words(path: &str) -> Vec<String> {
-    let file = File::open(path).unwrap();
-    let reader = io::BufReader::new(file);
-    let mut words = Vec::new();
-    for (line_number, line) in reader.lines().enumerate() {
-        let line = line.unwrap();
-        for word_with_punct in line.split_whitespace() {
-            let trimmed_word = word_with_punct
-                .trim_matches(|c: char| c.is_ascii_punctuation() || c.is_ascii_control());
-
-            if !trimmed_word.is_empty() {
-                words.push(trimmed_word.to_lowercase());
-            }
-        }
-        words.push("<EOL>".to_string());
-        if line_number % 1000000 == 0 {
-            eprintln!("Processed {} lines", line_number);
-        }
-    }
-
-    words
-}
-
 /// Convert each unique word to a unique token value.
 ///
 /// End-of-line (`<EOL>`) is assigned token value 0.
@@ -43,43 +16,74 @@ fn get_words(path: &str) -> Vec<String> {
 /// - A vector of tokens
 /// - A decoder vector mapping tokens back to words
 /// - A counts vector where counts[i] is the number of occurrences of token i
-fn tokenize_file(words: Vec<String>) -> (Vec<Token>, Vec<String>, Vec<usize>) {
+fn tokenize_reader<R: BufRead>(mut reader: R) -> (Vec<Token>, Vec<String>, Vec<usize>) {
     eprintln!("Tokenizing file");
 
     let mut token_map = HashMap::new();
     token_map.insert("<EOL>".to_string(), 0);
-    let mut ntokens = 1usize;
-
+    let mut token_decoder = vec!["<EOL>".to_string()];
+    let mut counts = vec![0usize];
     let mut token_vec = Vec::new();
-    for word in words {
-        let token = *token_map.entry(word.clone()).or_insert_with(|| {
-            if ntokens == Token::MAX as usize {
-                panic!("Too many unique tokens (max: {})", Token::MAX);
+    let mut line = String::new();
+    let mut line_number = 0usize;
+
+    loop {
+        line.clear();
+        let bytes_read = reader.read_line(&mut line).unwrap();
+        if bytes_read == 0 {
+            break;
+        }
+
+        for word_with_punct in line.split_whitespace() {
+            let trimmed_word = word_with_punct
+                .trim_matches(|c: char| c.is_ascii_punctuation() || c.is_ascii_control());
+
+            if trimmed_word.is_empty() {
+                continue;
             }
-            let new_token = ntokens as Token;
-            ntokens += 1;
-            new_token
-        });
-        token_vec.push(token);
-    }
-    eprintln!("Processed {} tokens, {} distinct", token_vec.len(), ntokens);
 
-    // Invert token_map into a decoder vector
-    let mut token_decoder = vec![String::new(); ntokens];
+            let normalized_word = trimmed_word.to_lowercase();
+            let token = if let Some(&token) = token_map.get(normalized_word.as_str()) {
+                token
+            } else {
+                if token_decoder.len() == Token::MAX as usize {
+                    panic!("Too many unique tokens (max: {})", Token::MAX);
+                }
+                let new_token = token_decoder.len() as Token;
+                token_map.insert(normalized_word.clone(), new_token);
+                token_decoder.push(normalized_word);
+                counts.push(0);
+                new_token
+            };
 
-    for (word, token) in token_map.drain() {
-        token_decoder[token as usize] = word;
-    }
-    eprintln!("Set up decoder");
+            token_vec.push(token);
+            counts[token as usize] += 1;
+        }
 
-    // Count occurrences of each token
-    let mut counts = vec![0; ntokens];
-    for &token in &token_vec {
-        counts[token as usize] += 1;
+        token_vec.push(0);
+        counts[0] += 1;
+
+        if line_number % 1000000 == 0 {
+            eprintln!("Processed {} lines", line_number);
+        }
+        line_number += 1;
     }
+
+    eprintln!(
+        "Processed {} tokens, {} distinct",
+        token_vec.len(),
+        token_decoder.len()
+    );
     eprintln!("Counted {} tokens", counts.len());
 
     (token_vec, token_decoder, counts)
+}
+
+/// Convert each unique word in a file to a unique token value.
+fn tokenize_file(path: &str) -> (Vec<Token>, Vec<String>, Vec<usize>) {
+    let file = File::open(path).unwrap();
+    let reader = io::BufReader::new(file);
+    tokenize_reader(reader)
 }
 
 /// Command line arguments for the sarray tool
@@ -375,9 +379,7 @@ fn main() {
     let args = Args::parse();
     let path = &args.file;
 
-    let words = get_words(path);
-    // eprintln!("{:?} words", words);
-    let (tokens, token_decoder, counts) = tokenize_file(words);
+    let (tokens, token_decoder, counts) = tokenize_file(path);
     // eprintln!("{:?} tokens", tokens);
     // eprintln!("{:?} token_decoder", token_decoder);
     // eprintln!("Token counts: {:?}", counts);
@@ -401,4 +403,30 @@ fn main() {
     //     println!("{} {} {} {}", sarray[i], tokens[sarray[i] as usize],token_decoder[tokens[sarray[i] as usize] as usize], lcp[i]);
     // }
     print_unique_substrings(&sarray, &lcp, &tokens, &token_decoder, &counts);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tokenize_reader;
+    use std::io::Cursor;
+
+    #[test]
+    fn tokenizer_trims_and_lowercases_words() {
+        let input = Cursor::new("Huh? don't!\n");
+        let (tokens, decoder, counts) = tokenize_reader(input);
+
+        assert_eq!(decoder, vec!["<EOL>", "huh", "don't"]);
+        assert_eq!(tokens, vec![1, 2, 0]);
+        assert_eq!(counts, vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn tokenizer_preserves_empty_lines_as_eol_tokens() {
+        let input = Cursor::new("Alpha\n\nbeta\n");
+        let (tokens, decoder, counts) = tokenize_reader(input);
+
+        assert_eq!(decoder, vec!["<EOL>", "alpha", "beta"]);
+        assert_eq!(tokens, vec![1, 0, 0, 2, 0]);
+        assert_eq!(counts, vec![3, 1, 1]);
+    }
 }
