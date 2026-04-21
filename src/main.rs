@@ -421,7 +421,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{sort_ranges_for_output, tokenize_reader, InterestingRange};
+    use super::{InterestingRange, sort_ranges_for_output, tokenize_reader};
     use std::io::Cursor;
 
     #[test]
