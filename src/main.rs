@@ -255,7 +255,9 @@ impl std::fmt::Debug for InterestingRangeHeap {
 ///
 /// This function uses the suffix array and LCP array to efficiently enumerate all unique
 /// substrings without explicitly storing them in a hash set. The key insights are:
-/// - Each suffix contributes new unique substrings that are longer than its LCP with the previous suffix
+/// - Each suffix contributes new unique substrings that are longer than its LCP with the next suffix
+///   in suffix-array order, so each distinct substring is emitted by the rightmost suffix in the
+///   contiguous block of suffixes that share it as a prefix
 /// - The number of occurrences can be found by looking at the range of suffixes that share the same prefix
 /// - Uses incremental boundary refinement to find occurrence ranges in O(n) amortized time per suffix
 ///
@@ -289,7 +291,9 @@ fn print_unique_substrings(
         let suffix_start = sarray[i] as usize;
         let suffix_len = (tokens.len() - suffix_start).min(MAX_NGRAM_LEN);
 
-        // Skip substrings already enumerated by the previous suffix (those with length <= lcp[i])
+        // Skip substrings that will be emitted by the suffix immediately to the left in the
+        // shared-prefix block. With lcp[i] = LCP(sarray[i], sarray[i + 1]), suffix i only owns
+        // substrings longer than lcp[i].
         let min_len = lcp[i] as usize + 1;
 
         for len in min_len..=suffix_len {
