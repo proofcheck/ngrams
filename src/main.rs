@@ -231,6 +231,16 @@ impl InterestingRangeHeap {
     }
 }
 
+/// Keep the score-based heap selection, but preserve the historical output shape:
+/// show longer n-grams before shorter ones when printing the retained ranges.
+fn sort_ranges_for_output(ranges: &mut [InterestingRange]) {
+    ranges.sort_by(|a, b| {
+        (b.end - b.start)
+            .cmp(&(a.end - a.start))
+            .then_with(|| b.score.cmp(&a.score))
+    });
+}
+
 // debugging output for an InterestingRangeHeap
 impl std::fmt::Debug for InterestingRangeHeap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -361,7 +371,7 @@ fn print_unique_substrings(
     // Iterate throught the best tokens by mi2
     let mut mi2_ranges: Vec<InterestingRange> =
         best_mi2.heap.drain().map(|wrapped| wrapped.0).collect();
-    mi2_ranges.sort_by(|a, b| b.score.cmp(&a.score));
+    sort_ranges_for_output(&mut mi2_ranges);
 
     for range in mi2_ranges {
         let suffix_start = sarray[range.start as usize] as usize;
@@ -407,7 +417,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::tokenize_reader;
+    use super::{sort_ranges_for_output, tokenize_reader, InterestingRange};
     use std::io::Cursor;
 
     #[test]
@@ -428,5 +438,26 @@ mod tests {
         assert_eq!(decoder, vec!["<EOL>", "alpha", "beta"]);
         assert_eq!(tokens, vec![1, 0, 0, 2, 0]);
         assert_eq!(counts, vec![3, 1, 1]);
+    }
+
+    #[test]
+    fn output_sort_prefers_longer_ranges_then_score() {
+        let mut ranges = vec![
+            InterestingRange::new(100.0, 10, 12),
+            InterestingRange::new(5.0, 20, 25),
+            InterestingRange::new(6.0, 30, 35),
+            InterestingRange::new(200.0, 40, 42),
+        ];
+
+        sort_ranges_for_output(&mut ranges);
+
+        let lengths_and_scores: Vec<(u32, f64)> = ranges
+            .iter()
+            .map(|range| (range.end - range.start, range.score.0))
+            .collect();
+        assert_eq!(
+            lengths_and_scores,
+            vec![(5, 6.0), (5, 5.0), (2, 200.0), (2, 100.0)]
+        );
     }
 }
