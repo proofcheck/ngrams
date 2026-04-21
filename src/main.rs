@@ -132,51 +132,51 @@ fn build_suffix_array(tokens: &[Token]) -> Vec<Index> {
 /// # Returns
 /// The LCP array where lcp[i] is the longest common prefix length between
 /// the suffixes at sarray[i] and sarray[i+1]
-fn build_lcp_array(sarray: &[Index], tokens: &[Token]) -> Vec<Index> {
+fn build_lcp_array(sarray: &[Index], tokens: &[Token]) -> Vec<u32> {
     eprintln!("Building LCP array");
 
     // Initialize the LCP array with zeros
-    let mut lcp: Vec<Index> = vec![0; sarray.len()];
+    let mut lcp: Vec<u32> = vec![0; sarray.len()];
 
     // Build the inverse suffix array: inv_sarray[i] tells us the position in sarray
     // where suffix i appears. This allows us to quickly find a suffix's position
     // in the sorted order.
-    let mut inv_sarray: Vec<usize> = vec![0; sarray.len()];
+    let mut inv_sarray: Vec<Index> = vec![0; sarray.len()];
     for (i, &s) in sarray.iter().enumerate() {
-        inv_sarray[s as usize] = i;
+        inv_sarray[s as usize] = i as Index;
     }
 
     // h tracks the LCP length from the previous iteration
     // Kasai's algorithm exploits the fact that if suffix i has LCP h with its successor,
     // then suffix i+1 has LCP at least h-1 with its successor (this is the key insight
     // that makes the algorithm O(n) instead of O(n²))
-    let mut h = 0;
+    let mut h: u32 = 0;
 
     // Iterate through suffixes in text order (not sorted order)
     for i in 0..sarray.len() {
         // If this suffix is the last one in sorted order, it has no successor to compare with
-        if inv_sarray[i] == sarray.len() - 1 {
+        if inv_sarray[i] as usize == sarray.len() - 1 {
             h = 0;
             continue;
         }
 
         // Find the next suffix in sorted order after suffix i
-        let j = sarray[inv_sarray[i] + 1] as usize;
+        let j = sarray[inv_sarray[i] as usize + 1] as usize;
 
         // Extend the common prefix as far as possible
         // Stop if we reach the end of either suffix, or if tokens differ,
         // or if we encounter an EOL token (0) in either suffix
-        while i + h < sarray.len()
-            && j + h < sarray.len()
-            && tokens[i + h] == tokens[j + h]
-            && tokens[i + h] != 0
-            && tokens[j + h] != 0
+        while i + (h as usize) < sarray.len()
+            && j + (h as usize) < sarray.len()
+            && tokens[i + (h as usize)] == tokens[j + (h as usize)]
+            && tokens[i + (h as usize)] != 0
+            && tokens[j + (h as usize)] != 0
         {
             h += 1;
         }
 
         // Store the LCP value at the position of suffix i in the sorted array
-        lcp[inv_sarray[i]] = h as Index;
+        lcp[inv_sarray[i] as usize] = h;
 
         // Decrease h by 1 for the next iteration (Kasai's optimization)
         // saturating_sub ensures we don't go below 0
@@ -266,7 +266,7 @@ impl std::fmt::Debug for InterestingRangeHeap {
 /// * `token_decoder` - Maps token IDs back to their string representations
 fn print_unique_substrings(
     sarray: &[Index],
-    lcp: &[Index],
+    lcp: &[u32],
     tokens: &[Token],
     token_decoder: &[String],
     counts: &[usize],
@@ -361,8 +361,8 @@ fn print_unique_substrings(
                         println!("PMI: {}", pmi);
                         println!("MI2: {}", mi2);
                     }
-                    best_mi2.push(InterestingRange::new(mi2, i as u32, (i + len) as u32));
-                    best_dice.push(InterestingRange::new(dice, i as u32, (i + len) as u32));
+                    best_mi2.push(InterestingRange::new(mi2, i as Index, (i + len) as Index));
+                    best_dice.push(InterestingRange::new(dice, i as Index, (i + len) as Index));
                 }
             }
         }
