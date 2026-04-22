@@ -20,7 +20,6 @@ fn tokenize_reader<R: BufRead>(mut reader: R) -> (Vec<Token>, Vec<String>, Vec<u
     eprintln!("Tokenizing file");
 
     let mut token_map = HashMap::new();
-    token_map.insert("<EOL>".to_string(), 0);
     let mut token_decoder = vec!["<EOL>".to_string()];
     let mut counts = vec![0usize];
     let mut token_vec = Vec::new();
@@ -35,25 +34,31 @@ fn tokenize_reader<R: BufRead>(mut reader: R) -> (Vec<Token>, Vec<String>, Vec<u
         }
 
         for word_with_punct in line.split_whitespace() {
-            let trimmed_word = word_with_punct
-                .trim_matches(|c: char| c.is_ascii_punctuation() || c.is_ascii_control());
-
-            if trimmed_word.is_empty() {
-                continue;
-            }
-
-            let normalized_word = trimmed_word.to_lowercase();
-            let token = if let Some(&token) = token_map.get(normalized_word.as_str()) {
+            // Check the raw token first so already-normalized entries avoid the
+            // trimming and lowercasing work entirely.
+            let token = if let Some(&token) = token_map.get(word_with_punct) {
                 token
             } else {
-                if token_decoder.len() == Token::MAX as usize {
-                    panic!("Too many unique tokens (max: {})", Token::MAX);
+                let trimmed_word = word_with_punct
+                    .trim_matches(|c: char| c.is_ascii_punctuation() || c.is_ascii_control());
+
+                if trimmed_word.is_empty() {
+                    continue;
                 }
-                let new_token = token_decoder.len() as Token;
-                token_map.insert(normalized_word.clone(), new_token);
-                token_decoder.push(normalized_word);
-                counts.push(0);
-                new_token
+
+                let normalized_word = trimmed_word.to_lowercase();
+                if let Some(&token) = token_map.get(normalized_word.as_str()) {
+                    token
+                } else {
+                    if token_decoder.len() == Token::MAX as usize {
+                        panic!("Too many unique tokens (max: {})", Token::MAX);
+                    }
+                    let new_token = token_decoder.len() as Token;
+                    token_map.insert(normalized_word.clone(), new_token);
+                    token_decoder.push(normalized_word);
+                    counts.push(0);
+                    new_token
+                }
             };
 
             token_vec.push(token);
@@ -442,6 +447,16 @@ mod tests {
         assert_eq!(decoder, vec!["<EOL>", "alpha", "beta"]);
         assert_eq!(tokens, vec![1, 0, 0, 2, 0]);
         assert_eq!(counts, vec![3, 1, 1]);
+    }
+
+    #[test]
+    fn tokenizer_keeps_literal_eol_text_distinct_from_eol_tokens() {
+        let input = Cursor::new("<EOL> <EOL>\n");
+        let (tokens, decoder, counts) = tokenize_reader(input);
+
+        assert_eq!(decoder, vec!["<EOL>", "eol"]);
+        assert_eq!(tokens, vec![1, 1, 0]);
+        assert_eq!(counts, vec![1, 2]);
     }
 
     #[test]
