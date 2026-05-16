@@ -1,0 +1,496 @@
+% LaTeX report for the suffix-array n-gram enumeration algorithm.
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{microtype}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+
+\title{Enumerating and Counting N-Grams with a Suffix Array}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{Problem}
+
+Let
+\[
+T = T[0], T[1], \ldots, T[N-1]
+\]
+be a tokenized corpus.  In the implementation, token value \(0\) is the end-of-line
+sentinel, and valid n-grams are not allowed to cross that sentinel.  For integers
+\(n_{\min}\) and \(n_{\max}\), the task is to enumerate each distinct contiguous
+token sequence
+\[
+P = T[p], T[p+1], \ldots, T[p+\ell-1]
+\]
+whose length \(\ell\) satisfies \(n_{\min} \leq \ell \leq n_{\max}\), whose tokens
+are all nonzero, and to count how many times \(P\) occurs in \(T\).
+
+The algorithm assumes a suffix array is available.  It also uses the adjacent
+longest-common-prefix array derived from the suffix array.
+
+\section{Definitions and Suffix-Array Notation}
+
+This report uses the following definitions.
+
+\begin{description}[leftmargin=2.4cm,style=nextline]
+    \item[\(T\)]
+    The tokenized corpus, represented as an array of integer token identifiers.
+    The expression \(T[a..b)\) denotes the half-open slice
+    \(T[a],T[a+1],\ldots,T[b-1]\).
+
+    \item[\(N\)]
+    The corpus length, so the valid token positions are \(0,\ldots,N-1\).
+
+    \item[\(\mathsf{EOL}\)]
+    The end-of-line sentinel token.  In the implementation \(\mathsf{EOL}=0\).
+    A valid n-gram contains no \(\mathsf{EOL}\) token.
+
+    \item[\(S_p\)]
+    The suffix beginning at token position \(p\), namely \(S_p=T[p..N)\).
+
+    \item[\(\mathit{SA}\)]
+    The suffix array.  It stores token positions, not token values.
+    \(\mathit{SA}[i]=p\) means that suffix \(S_p\) is at suffix-array position
+    \(i\).
+
+    \item[\(i,j,k\)]
+    Suffix-array positions unless otherwise stated.
+
+    \item[\(p,q\)]
+    Token positions in \(T\).
+
+    \item[\(\ell\)]
+    A candidate n-gram length.
+
+    \item[\(H\)]
+    The LCP array.  \(H[i]\) is the length of the longest common prefix of the
+    adjacent suffixes at suffix-array positions \(i\) and \(i+1\).  The final
+    entry is defined as \(H[N-1]=0\).
+
+    \item[\(P(i,\ell)\)]
+    The length-\(\ell\) prefix of the suffix at suffix-array position \(i\):
+    \(P(i,\ell)=T[\mathit{SA}[i]..\mathit{SA}[i]+\ell)\).
+
+    \item[Occurrence]
+    An occurrence of an n-gram \(P\) is a token position \(p\) such that
+    \(T[p..p+|P|)=P\).  Equivalently, suffix \(S_p\) begins with \(P\).
+
+    \item[Valid n-gram]
+    A token sequence \(P\) with \(n_{\min}\leq |P|\leq n_{\max}\) that occurs in
+    \(T\) and contains no \(\mathsf{EOL}\) token.
+\end{description}
+
+For each position \(p\), let \(S_p = T[p..N)\) be the suffix beginning at \(p\).
+The suffix array \(\mathit{SA}\) is a permutation of \(0,\ldots,N-1\) such that
+\[
+S_{\mathit{SA}[0]} < S_{\mathit{SA}[1]} < \cdots < S_{\mathit{SA}[N-1]}
+\]
+in lexicographic order.
+
+Define the LCP array \(H\) by
+\[
+H[i] = \operatorname{lcp}(S_{\mathit{SA}[i]}, S_{\mathit{SA}[i+1]})
+\quad \text{for } 0 \leq i < N-1,
+\]
+and set \(H[N-1] = 0\).  The implementation's LCP computation stops when either
+suffix reaches an end-of-line sentinel, so \(H[i]\) never counts a token sequence
+that crosses a line boundary.
+
+For a suffix-array index \(i\) and length \(\ell\), define the candidate prefix
+\[
+P(i,\ell)=T[\mathit{SA}[i]..\mathit{SA}[i]+\ell).
+\]
+
+\section{Direct Search Algorithm and N-Gram Enumeration}
+
+\subsection{Suffix-Array Interval Property}
+
+The report uses the standard suffix-array interval property without proving it:
+for any token sequence \(P\), all suffixes that begin with \(P\) occupy one
+contiguous interval in suffix-array order.  The algorithms below are concerned
+with finding the endpoints of those intervals and assigning counts to them.
+
+\subsection{Counting by Searching Left and Right}
+
+The direct search algorithm is the implementation's
+\texttt{count\_ngram\_occurrences} routine.  Its arguments are
+\(\mathit{suffix\_index}\), \(\mathit{len}\), and \(\mathit{lcp}\).  In the
+mathematical notation used here, \(\mathit{suffix\_index}=i\),
+\(\mathit{len}=\ell\), and \(\mathit{lcp}=H\).
+
+For a fixed suffix-array position \(i\) and candidate length \(\ell\), the
+routine expands from \(i\) to find the full contiguous block of suffixes that
+share the prefix \(P(i,\ell)\).
+
+\begin{verbatim}
+count_ngram_occurrences(i, ell, H):
+    left = i
+    right = i
+
+    # Left-loop invariant:
+    #   Let [L, R] be the maximal interval whose suffixes begin
+    #   with P(i, ell). At the start of each iteration,
+    #   L <= left <= i, and every suffix-array position in
+    #   [left, i] begins with P(i, ell).
+    while left > 0 and H[left - 1] >= ell:
+        left -= 1
+
+    # Right-loop invariant:
+    #   At the start of each iteration, i <= right <= R, and
+    #   every suffix-array position in [i, right] begins with
+    #   P(i, ell).
+    while right < N and H[right] >= ell:
+        right += 1
+
+    # At this point left = L and right = R, so the count is
+    # the number of suffixes in the maximal matching interval.
+    return right - left + 1
+\end{verbatim}
+
+Let \([L,R]\) be the maximal suffix-array interval whose suffixes begin with
+\(P(i,\ell)\).  Because \(i\) itself begins with \(P(i,\ell)\), we have
+\(L \leq i \leq R\).
+
+The left-loop invariant is written directly above the first loop in the
+pseudocode.  Initially, \(\mathit{left}=i\), so the interval contains only the
+candidate suffix and the invariant holds.  If the loop condition is true, then
+\(H[\mathit{left}-1] \geq \ell\), so suffixes at positions \(\mathit{left}-1\)
+and \(\mathit{left}\) share their first \(\ell\) tokens.  Since the suffix at
+\(\mathit{left}\) begins with \(P(i,\ell)\), the suffix at \(\mathit{left}-1\)
+also begins with \(P(i,\ell)\).  Decrementing \(\mathit{left}\) preserves all
+claims in the comment.
+
+The right-loop invariant is written above the second loop.  Initially,
+\(\mathit{right}=i\), so the invariant is immediate.  If the loop condition is
+true, then \(H[\mathit{right}] \geq \ell\), meaning the suffixes at positions
+\(\mathit{right}\) and \(\mathit{right}+1\) share their first \(\ell\) tokens.
+Since the suffix at \(\mathit{right}\) begins with \(P(i,\ell)\), the suffix at
+\(\mathit{right}+1\) also begins with \(P(i,\ell)\).  Incrementing
+\(\mathit{right}\) preserves the invariant.
+
+\begin{theorem}[Correctness of counting]
+The counting routine returns exactly the number of occurrences of
+\(P(i,\ell)\) in the corpus.
+\end{theorem}
+
+\begin{proof}
+By the left-expansion invariant, the left loop never moves outside the matching
+interval \([L,R]\).  It stops only when \(\mathit{left}=0\) or
+\(H[\mathit{left}-1] < \ell\).  In the latter case, the adjacent suffix to the
+left does not share the candidate prefix, so maximality of \([L,R]\) implies
+\(\mathit{left}=L\).  The boundary case \(\mathit{left}=0\) also gives
+\(\mathit{left}=L\).
+
+The same argument using the right-expansion invariant shows that the right loop
+stops with \(\mathit{right}=R\).  Therefore the routine returns
+\[
+R-L+1,
+\]
+the exact number of suffixes that begin with \(P(i,\ell)\).  Each such suffix
+corresponds to one occurrence of the n-gram in \(T\), so the returned count is
+exact.
+\end{proof}
+
+\subsection{N-Gram Enumeration Using Direct Search}
+
+The direct enumerator scans the suffix array from left to right.  A distinct
+n-gram is emitted by the rightmost suffix in its suffix-array interval.  At
+suffix-array position \(i\), prefixes of length at most \(H[i]\) are also
+prefixes of the next suffix, so they are owned later.  Prefixes longer than
+\(H[i]\) are owned by the current suffix.
+
+\begin{verbatim}
+enumerate_by_search(SA, H, T, n_min, n_max):
+    for i = 0 to N - 1:
+        # Outer-loop invariant:
+        #   After positions 0..i-1 have been processed, every valid
+        #   n-gram whose rightmost matching suffix-array position is
+        #   less than i has been emitted exactly once, and every valid
+        #   n-gram whose rightmost matching suffix-array position is
+        #   at least i has not yet been emitted.
+        start = SA[i]
+        suffix_len = min(N - start, n_max)
+        min_unique_len = H[i] + 1
+
+        for ell in min_unique_len..=suffix_len:
+            # Inner-loop invariant:
+            #   The current suffix owns only prefix lengths greater
+            #   than H[i], because all shorter prefixes are also
+            #   prefixes of the next suffix in suffix-array order.
+            if T[start + ell - 1] == EOL:
+                break
+            if ell < n_min:
+                continue
+            count = count_ngram_occurrences(i, ell, H)
+            emit P(i, ell) with count
+\end{verbatim}
+
+\begin{proof}
+The outer-loop invariant is written directly in the pseudocode.  It is true
+before the first iteration: no positions have been processed, and no valid
+n-gram has a rightmost occurrence before position \(0\).
+
+Assume it holds at the start of the iteration for suffix-array position \(i\).
+Consider any valid n-gram \(P\) whose matching suffix interval is \([L,R]\).
+If \(R<i\), the induction hypothesis says \(P\) was already emitted exactly once,
+and the current iteration cannot emit it because \(i\) is outside its interval.
+If \(R>i\), then either the current suffix does not have prefix \(P\), or
+\(i\in[L,R]\) and \(H[i]\geq |P|\), so the inner loop skips length \(|P|\).
+If \(R=i\), then \(H[i]<|P|\), so the inner loop reaches length \(|P|\), the
+validity checks pass, and the current iteration emits \(P\).  Therefore the
+invariant is preserved.
+\end{proof}
+
+\begin{theorem}[Correctness of direct enumeration]
+The direct enumeration algorithm emits every distinct valid n-gram exactly once,
+and each emitted n-gram is paired with its exact occurrence count.
+\end{theorem}
+
+\begin{proof}
+The invariant above gives uniqueness and completeness: every valid n-gram is
+emitted exactly when the scan reaches the right endpoint of its suffix-array
+interval.  The direct counting routine gives the exact count by the correctness
+of the direct search algorithm.
+\end{proof}
+
+\section{Stack Algorithm and N-Gram Enumeration}
+
+The direct enumerator calls \texttt{count\_ngram\_occurrences} for each emitted
+candidate, and that routine searches left and right.  A stack-based alternative
+finds all repeated-candidate intervals in one pass over the LCP array.  This is
+the same structural idea used to process a histogram with a monotone stack: an
+LCP value starts an active interval, and a later smaller LCP value closes every
+active interval that can no longer extend to the right.
+
+The algorithm below emits records of the form
+\[
+(\mathit{left},\mathit{right},\ell_{\min},\ell_{\max},\mathit{count}).
+\]
+Such a record means that, for every length
+\(\ell_{\min}\leq \ell\leq \ell_{\max}\), the n-gram
+\[
+T[\mathit{SA}[\mathit{right}]..\mathit{SA}[\mathit{right}]+\ell)
+\]
+occurs exactly \(\mathit{count}\) times, and its matching suffixes are precisely
+the suffix-array positions
+\[
+\mathit{left},\mathit{left}+1,\ldots,\mathit{right}.
+\]
+The interval pass emits repeated n-grams, meaning n-grams with count at least
+two.  The complete stack-based n-gram enumerator below runs this interval pass
+first, then emits singleton n-grams from each suffix for lengths greater than
+both neighboring LCP values, \(H[i-1]\) and \(H[i]\), treating missing neighbors
+as \(0\).
+
+The stack starts empty because no positive repeated-prefix interval is active
+before the first LCP value is read.  A zero LCP value starts nothing: it says
+the adjacent suffixes at that boundary share no positive-length prefix, and it
+also closes any intervals already on the stack.  The first positive value
+\(H[b]>0\) starts the first active interval at suffix-array position \(b\),
+representing the fact that suffixes \(b\) and \(b+1\) share a prefix of length
+\(H[b]\).  If every entry of \(H\) is zero, then there are no repeated
+positive-length n-grams for the stack algorithm to emit.
+
+\begin{verbatim}
+stack_lcp_intervals(SA, H, n_min, n_max):
+    stack = empty stack of (left, height)
+
+    for b = 0 to N - 1:
+        cur = H[b]          # H[N - 1] is the final 0 sentinel.
+        start = b
+
+        # Stack invariant:
+        #   Heights in stack are strictly increasing from bottom to top.
+        #   Each entry (left, height) is an active interval [left, b]:
+        #     every processed LCP value H[t] with left <= t < b
+        #     is at least height.
+        #   The entry's left value is the earliest suffix-array
+        #     position to which that height can extend without
+        #     crossing a smaller LCP value.
+        while stack is not empty and stack.top.height > cur:
+            (left, height) = stack.pop()
+
+            parent = cur
+            if stack is not empty:
+                parent = max(parent, stack.top.height)
+
+            low = max(parent + 1, n_min)
+            high = min(height, n_max)
+            if low <= high:
+                # Closed-interval invariant at this point:
+                #   [left, b] is the maximal suffix-array interval
+                #   whose adjacent LCP values are all at least height.
+                #   For every ell in [low, high], that same suffix
+                #   interval is the maximal interval for the ell-token
+                #   prefix represented by this stack entry.
+                emit (left, b, low, high, b - left + 1)
+
+            start = left
+
+        # If cur == 0, no positive repeated-prefix interval starts here.
+        # If cur > 0, this boundary starts an interval beginning at start:
+        # suffix-array positions start and b + 1 share cur prefix tokens.
+        if cur > 0 and (stack is empty or stack.top.height < cur):
+            stack.push((start, cur))
+\end{verbatim}
+
+\subsection{Stack Proof}
+
+\begin{lemma}
+When an entry \((\mathit{left},h)\) is popped at boundary \(b\), the suffix-array
+positions \([\mathit{left},b]\) form a maximal interval whose adjacent LCP
+values are all at least \(h\).
+\end{lemma}
+
+\begin{proof}
+The stack invariant is stated in the comments before the while loop.  It says
+that every processed LCP value \(H[t]\) for
+\(\mathit{left}\leq t < b\) is at least \(h\), so every adjacent suffix pair
+inside \([\mathit{left},b]\) shares a prefix of length \(h\).  Therefore all
+suffixes in the interval share the same length-\(h\) prefix.
+
+The entry is popped only when \(\mathit{cur}=H[b]<h\), so the interval cannot be
+extended one position to the right.  The entry's \(\mathit{left}\) value was set
+when height \(h\) became active or inherited from a taller popped interval; by
+the invariant, it is the earliest position reachable without crossing an LCP
+value below \(h\).  Thus the interval cannot be extended one position to the
+left either.  The popped interval is maximal.
+\end{proof}
+
+\begin{lemma}
+For a popped entry with height \(h\), the emitted length range
+\[
+\max(\mathit{parent}+1,n_{\min}) \leq \ell \leq \min(h,n_{\max})
+\]
+contains exactly the lengths owned by that interval.
+\end{lemma}
+
+\begin{proof}
+The value \(\mathit{parent}\) is the larger of the new current LCP value and the
+height of the new stack top after the pop.  Lengths at most \(\mathit{parent}\)
+are still represented by an enclosing interval: either that enclosing interval
+remains active on the stack, or the current LCP value shows that such a shorter
+prefix continues across boundary \(b\).  Emitting those shorter lengths here
+would duplicate the enclosing interval.
+
+Lengths greater than \(h\) are not shared by all suffixes in
+\([\mathit{left},b]\), because \(h\) is the largest common prefix length
+guaranteed by the popped entry.  Therefore the lengths strictly above
+\(\mathit{parent}\) and at most \(h\), after applying the requested
+\(n_{\min}\) and \(n_{\max}\) bounds, are exactly the lengths for which this
+closed interval is responsible.
+\end{proof}
+
+\begin{theorem}[Correctness of stack-based intervals]
+The stack algorithm emits each repeated valid n-gram interval exactly once, with
+the exact occurrence count for every length in the emitted range.
+\end{theorem}
+
+\begin{proof}
+Consider any valid n-gram \(P\) that occurs at least twice, and let
+\([L,R]\) be the maximal suffix-array interval whose suffixes begin with \(P\).
+By the suffix-array interval property, this interval is contiguous.  Let
+\(\ell=|P|\).  The LCP values \(H[L],H[L+1],\ldots,H[R-1]\) are all at least
+\(\ell\), while the boundary values just outside the interval are either absent
+or less than \(\ell\).  During the left-to-right scan, some stack entry
+therefore covers height at least \(\ell\) starting at \(L\), remains active
+through \(R-1\), and is forced to close at the first boundary after \(R\).
+
+When that entry closes, the previous lemma assigns length \(\ell\) to exactly
+one emitted range: not to a child interval whose parent height is already at
+least \(\ell\), and not to the enclosing interval whose length range stops at
+the child height.  Thus \(P\)'s interval is emitted exactly once.  The emitted
+count is \(R-L+1\), the number of suffixes in the maximal interval, which is
+exactly the number of occurrences of \(P\).
+\end{proof}
+
+\subsection{Complete N-Gram Enumeration Using the Stack}
+
+The stack interval pass covers exactly the repeated n-grams.  The remaining
+valid n-grams are singletons.  For suffix-array position \(i\), a prefix has
+another occurrence if and only if its length is at most one of the two adjacent
+LCP values \(H[i-1]\) or \(H[i]\).  Therefore singleton prefixes at \(i\) are
+exactly those with length greater than
+\[
+\max(H[i-1],H[i]),
+\]
+again treating missing neighbors as \(0\).
+
+\begin{verbatim}
+enumerate_by_stack(SA, H, T, n_min, n_max):
+    for (left, right, low, high, count) in
+            stack_lcp_intervals(SA, H, n_min, n_max):
+        for ell in low..=high:
+            emit T[SA[right]..SA[right] + ell) with count
+
+    for i = 0 to N - 1:
+        prev = 0 if i == 0 else H[i - 1]
+        next = H[i]
+        first_singleton_len = max(prev, next, n_min - 1) + 1
+        suffix_len = min(N - SA[i], n_max)
+
+        for ell in first_singleton_len..=suffix_len:
+            # Singleton-loop invariant:
+            #   Any prefix length <= max(prev, next) has another
+            #   occurrence adjacent to suffix i in suffix-array order.
+            #   Any longer prefix has no other occurrence.
+            if T[SA[i] + ell - 1] == EOL:
+                break
+            emit T[SA[i]..SA[i] + ell) with count 1
+\end{verbatim}
+
+\begin{theorem}[Correctness of stack-based enumeration]
+The complete stack-based enumerator emits every distinct valid n-gram exactly
+once, with its exact occurrence count.
+\end{theorem}
+
+\begin{proof}
+If a valid n-gram occurs at least twice, its suffix-array interval has at least
+two positions.  The stack interval theorem emits its interval exactly once, with
+the exact count, and the singleton pass does not emit it because its length is at
+most one of the adjacent LCP values at each occurrence.
+
+If a valid n-gram occurs exactly once at suffix-array position \(i\), then no
+other suffix has that prefix.  By the suffix-array interval property, this is
+equivalent to saying that neither adjacent suffix shares that full prefix, so
+its length is greater than both neighboring LCP values.  The singleton pass
+therefore emits it at position \(i\), with count \(1\), and no other suffix can
+emit the same n-gram because it has no other occurrence.
+\end{proof}
+
+\section{Filtering and Ranking}
+
+After enumeration and counting, the implementation applies the requested
+minimum-count threshold and scoring function.  This filtering does not affect
+the correctness of enumeration or counting: it only decides which correctly
+counted candidates are retained for output.  When a maximum heap size is
+specified, the heap keeps the best scored candidates seen so far; when the limit
+is zero, all scored candidates are retained and sorted for final output.
+
+\section{Complexity}
+
+Let \(N\) be the number of tokens and \(M=n_{\max}\).  Given a suffix array, the
+LCP array can be built in \(O(N)\) time with Kasai's algorithm.  The rightmost
+ownership enumeration loop considers at most \(M\) prefix lengths per suffix
+before accounting for end-of-line breaks, so its candidate-generation work is
+\(O(NM)\).
+
+The direct \texttt{count\_ngram\_occurrences} routine expands across the
+suffix-array interval for each emitted candidate.  In the worst case, this can
+add another factor proportional to the size of the matching interval.
+
+The stack-based interval algorithm avoids those repeated left and right scans.
+Each LCP height is pushed once and popped once, so the stack maintenance is
+\(O(N)\).  Its total running time is \(O(N+Q)\), where \(Q\) is the number of
+emitted interval-length ranges after applying \(n_{\min}\) and \(n_{\max}\).
+
+\end{document}
