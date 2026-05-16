@@ -441,27 +441,11 @@ fn score_frequency(
     Some(ngram_occurrences as f64)
 }
 
-/// Count how many suffixes share the candidate prefix at a given suffix-array position.
-fn count_ngram_occurrences(suffix_index: usize, len: usize, lcp: &[u32]) -> usize {
-    // Expand left and right across the contiguous suffix block with this prefix.
-    let mut left = suffix_index;
-    let mut right = suffix_index;
-    while left > 0 && lcp[left - 1] as usize >= len {
-        left -= 1;
-    }
-
-    while right < lcp.len() && lcp[right] as usize >= len {
-        right += 1;
-    }
-
-    right - left + 1
-}
-
 /// Enumerate unique n-gram candidates, score them, and retain the best matches.
 ///
-/// This function uses the suffix array and LCP array to efficiently enumerate all unique
-/// substrings without explicitly storing them in a hash set. Each suffix contributes new
-/// unique substrings that are longer than its LCP with the next suffix in suffix-array order.
+/// This function uses a monotone stack over the LCP array to emit repeated suffix-array
+/// interval classes exactly once. Singleton n-grams are intentionally skipped because
+/// the ranking workflow screens out low-frequency candidates before scoring.
 fn collect_top_scored_ngrams(
     sarray: &[Index],
     lcp: &[u32],
@@ -473,53 +457,74 @@ fn collect_top_scored_ngrams(
     min_count: usize,
     scoring_function: ScoringFunction,
 ) -> Vec<ScoredNgram> {
-    // Key insight: As substring length increases, the valid matching range [left, right]
-    // can only shrink. We incrementally refine boundaries as we process longer substrings.
     eprintln!("Scoring ngrams");
 
     let corpus_token_count = token_occurrences.iter().sum::<usize>();
     let mut best_ngrams = ScoredNgramHeap::new(max_heap_size);
 
-    for suffix_index in 0..sarray.len() {
-        let suffix_start = sarray[suffix_index] as usize;
-        let suffix_len = (tokens.len() - suffix_start).min(max_ngram_size);
+    // Each stack entry is (left, prefix_len), meaning suffix-array positions
+    // left..=boundary share prefix_len tokens at the current scan boundary.
+    let mut stack: Vec<(usize, usize)> = Vec::new();
 
-        // Skip substrings that will be emitted by the suffix immediately to the left in the
-        // shared-prefix block. With lcp[suffix_index] = LCP(sarray[i], sarray[i + 1]),
-        // this suffix only owns substrings longer than that LCP.
-        let min_unique_len = lcp[suffix_index] as usize + 1;
+    for boundary in 0..sarray.len() {
+        let boundary_lcp = lcp[boundary] as usize;
+        let mut interval_start = boundary;
 
-        for len in min_unique_len..=suffix_len {
-            // Stop if we encounter an EOL token (i.e., don't cross line boundaries)
-            if tokens[suffix_start + len - 1] == 0 {
-                break;
+        while stack
+            .last()
+            .is_some_and(|&(_, prefix_len)| prefix_len > boundary_lcp)
+        {
+            // The current boundary is too short for the top prefix, so that
+            // prefix owns the interval ending at this boundary.
+            let (left, prefix_len) = stack.pop().unwrap();
+            let right = boundary;
+            let ngram_occurrences = right - left + 1;
+
+            // Shorter lengths belong to the enclosing interval, represented by
+            // either the new stack top or the current boundary LCP.
+            let mut parent_len = boundary_lcp;
+            if let Some(&(_, enclosing_prefix_len)) = stack.last() {
+                parent_len = parent_len.max(enclosing_prefix_len);
             }
 
-            // Respect the caller's lower n-gram bound after preserving EOL detection.
-            if len < min_ngram_size {
-                continue;
+            if ngram_occurrences >= min_count {
+                let first_len = (parent_len + 1).max(min_ngram_size);
+                let last_len = prefix_len.min(max_ngram_size);
+
+                if first_len <= last_len {
+                    let suffix_start = sarray[right] as usize;
+
+                    for len in first_len..=last_len {
+                        let ngram_tokens = &tokens[suffix_start..suffix_start + len];
+
+                        if let Some(score) = scoring_function(
+                            ngram_tokens,
+                            ngram_occurrences,
+                            token_occurrences,
+                            corpus_token_count,
+                        ) {
+                            best_ngrams.push(ScoredNgram::new(
+                                score,
+                                suffix_start as Index,
+                                right as Index,
+                                len as Index,
+                            ));
+                        }
+                    }
+                }
             }
 
-            let ngram_tokens = &tokens[suffix_start..suffix_start + len];
-            let ngram_occurrences = count_ngram_occurrences(suffix_index, len, lcp);
+            interval_start = left;
+        }
 
-            if ngram_occurrences < min_count {
-                continue;
-            }
-
-            if let Some(score) = scoring_function(
-                ngram_tokens,
-                ngram_occurrences,
-                token_occurrences,
-                corpus_token_count,
-            ) {
-                best_ngrams.push(ScoredNgram::new(
-                    score,
-                    suffix_start as Index,
-                    suffix_index as Index,
-                    len as Index,
-                ));
-            }
+        // A positive boundary LCP starts, or continues, the interval inherited
+        // from the last popped entry.
+        if boundary_lcp > 0
+            && stack
+                .last()
+                .is_none_or(|&(_, prefix_len)| prefix_len < boundary_lcp)
+        {
+            stack.push((interval_start, boundary_lcp));
         }
     }
 
@@ -827,5 +832,55 @@ mod tests {
                 && tokens[scored_ngram.token_start as usize..scored_ngram.token_start as usize + 2]
                     == [1, 2]
         }));
+    }
+
+    #[test]
+    fn stack_enumeration_scores_repeated_ngram_once() {
+        let corpus = "a b\nx a b\n";
+        let (tokens, _decoder, token_occurrences) = tokenize_reader(Cursor::new(corpus));
+        let sarray = build_suffix_array(&tokens);
+        let lcp = build_lcp_array(&sarray, &tokens);
+        let scored_ngrams = collect_top_scored_ngrams(
+            &sarray,
+            &lcp,
+            &tokens,
+            &token_occurrences,
+            2,
+            2,
+            2000,
+            2,
+            scoring_function_for(RankBy::Frequency),
+        );
+
+        let repeated_bigrams: Vec<&ScoredNgram> = scored_ngrams
+            .iter()
+            .filter(|scored_ngram| {
+                let token_start = scored_ngram.token_start as usize;
+                scored_ngram.score.0 == 2.0 && tokens[token_start..token_start + 2] == [1, 2]
+            })
+            .collect();
+
+        assert_eq!(repeated_bigrams.len(), 1);
+    }
+
+    #[test]
+    fn stack_enumeration_skips_singletons_even_with_count_threshold_one() {
+        let corpus = "a b\nc d\n";
+        let (tokens, _decoder, token_occurrences) = tokenize_reader(Cursor::new(corpus));
+        let sarray = build_suffix_array(&tokens);
+        let lcp = build_lcp_array(&sarray, &tokens);
+        let scored_ngrams = collect_top_scored_ngrams(
+            &sarray,
+            &lcp,
+            &tokens,
+            &token_occurrences,
+            2,
+            2,
+            2000,
+            1,
+            scoring_function_for(RankBy::Frequency),
+        );
+
+        assert!(scored_ngrams.is_empty());
     }
 }
