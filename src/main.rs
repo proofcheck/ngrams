@@ -132,7 +132,7 @@ struct Args {
     #[arg(short = 'k', long, default_value_t = DEFAULT_MAX_HEAP_SIZE)]
     max_heap_size: usize,
 
-    /// Minimum number of times an n-gram must occur to be scored
+    /// Minimum repeated n-gram occurrence count to score; must be at least 2
     #[arg(short = 'c', long, default_value_t = DEFAULT_MIN_COUNT)]
     min_count: usize,
 }
@@ -149,8 +149,10 @@ impl Args {
                 self.max_ngram_size, self.min_ngram_size
             ));
         }
-        if self.min_count == 0 {
-            return Err("--min-count must be at least 1".to_string());
+        if self.min_count < 2 {
+            return Err(
+                "--min-count must be at least 2 because enumeration is repeated-only".to_string(),
+            );
         }
         Ok(())
     }
@@ -441,11 +443,10 @@ fn score_frequency(
     Some(ngram_occurrences as f64)
 }
 
-/// Enumerate unique n-gram candidates, score them, and retain the best matches.
+/// Enumerate repeated n-gram candidates, score them, and retain the best matches.
 ///
 /// This function uses a monotone stack over the LCP array to emit repeated suffix-array
-/// interval classes exactly once. Singleton n-grams are intentionally skipped because
-/// the ranking workflow screens out low-frequency candidates before scoring.
+/// interval classes exactly once. It intentionally does not enumerate singleton n-grams.
 fn collect_top_scored_ngrams(
     sarray: &[Index],
     lcp: &[u32],
@@ -459,42 +460,85 @@ fn collect_top_scored_ngrams(
 ) -> Vec<ScoredNgram> {
     eprintln!("Scoring ngrams");
 
+    debug_assert!(
+        min_count >= 2,
+        "stack interval enumeration is repeated-only"
+    );
+
+    // corpus_token_count is the denominator scale used by PMI-based scores.
     let corpus_token_count = token_occurrences.iter().sum::<usize>();
+
+    // best_ngrams owns the ranking policy: either retain every scored candidate
+    // or retain only the highest-scoring fixed-size heap.
     let mut best_ngrams = ScoredNgramHeap::new(max_heap_size);
 
-    // Each stack entry is (left, prefix_len), meaning suffix-array positions
-    // left..=boundary share prefix_len tokens at the current scan boundary.
+    // stack stores active LCP intervals as (left, prefix_len).
+    //
+    // Stack invariant at the start of each boundary iteration:
+    // - Prefix lengths are strictly increasing from bottom to top.
+    // - Each entry (left, prefix_len) represents suffix-array positions
+    //   left..=boundary sharing the same prefix_len-token prefix.
+    // - left is the earliest suffix-array position from which that prefix is
+    //   shared by every suffix through boundary.
     let mut stack: Vec<(usize, usize)> = Vec::new();
 
     for boundary in 0..sarray.len() {
+        // boundary is the right edge currently being processed. LCP[boundary]
+        // compares suffix-array positions boundary and boundary + 1. The final
+        // LCP value is the zero sentinel that flushes all active intervals.
         let boundary_lcp = lcp[boundary] as usize;
+
+        // interval_start is the left edge to use if boundary_lcp starts a new
+        // active interval. It moves left when taller intervals are popped, so
+        // shorter prefixes inherit the full interval they can still cover.
         let mut interval_start = boundary;
 
+        // Pop every active prefix that cannot cross the current boundary.
+        //
+        // Loop invariant:
+        // - Before each pop, all stack entries below the top still represent
+        //   valid active intervals ending at this boundary.
+        // - interval_start is the leftmost position inherited from intervals
+        //   popped so far at this boundary.
         while stack
             .last()
             .is_some_and(|&(_, prefix_len)| prefix_len > boundary_lcp)
         {
-            // The current boundary is too short for the top prefix, so that
-            // prefix owns the interval ending at this boundary.
+            // left and prefix_len describe the interval that just ended:
+            // suffixes left..=right share prefix_len tokens, and no suffix
+            // just outside the interval can extend that same prefix.
             let (left, prefix_len) = stack.pop().unwrap();
+
+            // right is the inclusive right endpoint of the popped suffix-array
+            // interval. Its suffix is used as the representative n-gram source.
             let right = boundary;
+
+            // ngram_occurrences is the number of suffixes in the interval, so
+            // it is the occurrence count for every owned length in this class.
             let ngram_occurrences = right - left + 1;
 
-            // Shorter lengths belong to the enclosing interval, represented by
-            // either the new stack top or the current boundary LCP.
+            // parent_len is the longest prefix length owned by an enclosing
+            // interval. The popped interval owns only lengths greater than this.
             let mut parent_len = boundary_lcp;
             if let Some(&(_, enclosing_prefix_len)) = stack.last() {
                 parent_len = parent_len.max(enclosing_prefix_len);
             }
 
+            // Low-frequency interval classes cannot contribute scored n-grams.
             if ngram_occurrences >= min_count {
+                // first_len and last_len bound the concrete n-gram lengths
+                // owned by this interval after applying caller limits.
                 let first_len = (parent_len + 1).max(min_ngram_size);
                 let last_len = prefix_len.min(max_ngram_size);
 
                 if first_len <= last_len {
+                    // suffix_start is the corpus token position for the
+                    // representative suffix at the interval's right endpoint.
                     let suffix_start = sarray[right] as usize;
 
                     for len in first_len..=last_len {
+                        // ngram_tokens is valid without an EOL check because
+                        // LCP construction stops before crossing EOL.
                         let ngram_tokens = &tokens[suffix_start..suffix_start + len];
 
                         if let Some(score) = scoring_function(
@@ -517,8 +561,14 @@ fn collect_top_scored_ngrams(
             interval_start = left;
         }
 
-        // A positive boundary LCP starts, or continues, the interval inherited
-        // from the last popped entry.
+        // Push boundary_lcp if it starts a new positive active interval.
+        //
+        // Push invariant:
+        // - boundary_lcp == 0 starts no repeated prefix.
+        // - If boundary_lcp is already represented by the current stack top,
+        //   the existing interval simply continues.
+        // - If it is larger than the current stack top, interval_start is the
+        //   earliest left endpoint for that new shared prefix.
         if boundary_lcp > 0
             && stack
                 .last()
@@ -727,12 +777,17 @@ mod tests {
     }
 
     #[test]
-    fn args_reject_zero_min_count() {
-        let args = Args::try_parse_from(["ngrams", "-c", "0", "input.txt"]).unwrap();
+    fn args_reject_min_count_below_repeated_threshold() {
+        let zero_count_args = Args::try_parse_from(["ngrams", "-c", "0", "input.txt"]).unwrap();
+        let one_count_args = Args::try_parse_from(["ngrams", "-c", "1", "input.txt"]).unwrap();
 
         assert_eq!(
-            args.validate().unwrap_err(),
-            "--min-count must be at least 1"
+            zero_count_args.validate().unwrap_err(),
+            "--min-count must be at least 2 because enumeration is repeated-only"
+        );
+        assert_eq!(
+            one_count_args.validate().unwrap_err(),
+            "--min-count must be at least 2 because enumeration is repeated-only"
         );
     }
 
@@ -864,7 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn stack_enumeration_skips_singletons_even_with_count_threshold_one() {
+    fn stack_enumeration_skips_singletons() {
         let corpus = "a b\nc d\n";
         let (tokens, _decoder, token_occurrences) = tokenize_reader(Cursor::new(corpus));
         let sarray = build_suffix_array(&tokens);
@@ -877,7 +932,7 @@ mod tests {
             2,
             2,
             2000,
-            1,
+            2,
             scoring_function_for(RankBy::Frequency),
         );
 
