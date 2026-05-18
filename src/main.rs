@@ -74,7 +74,7 @@ fn tokenize_reader<R: BufRead>(mut reader: R) -> (Vec<Token>, Vec<String>, Vec<u
         token_vec.push(0);
         token_occurrences[0] += 1;
 
-        if line_number % 1000000 == 0 {
+        if line_number.is_multiple_of(1000000) {
             eprintln!("Processed {} lines", line_number);
         }
         line_number += 1;
@@ -204,12 +204,13 @@ fn build_suffix_array(tokens: &[Token]) -> Vec<Index> {
 ///
 /// # Returns
 /// The LCP array where lcp[i] is the longest common prefix length between
-/// the suffixes at sarray[i] and sarray[i+1]
-fn build_lcp_array(sarray: &[Index], tokens: &[Token]) -> Vec<u32> {
+/// the suffixes at sarray[i] and sarray[i+1].
+fn build_lcp_array(sarray: &[Index], tokens: &[Token]) -> Vec<u8> {
     eprintln!("Building LCP array");
 
-    // Initialize the LCP array with zeros
-    let mut lcp: Vec<u32> = vec![0; sarray.len()];
+    // Store LCP values compactly; current corpora have maximum values under
+    // u8::MAX, and the assignment below checks that assumption.
+    let mut lcp: Vec<u8> = vec![0; sarray.len()];
 
     // Build the inverse suffix array: inv_sarray[i] tells us the position in sarray
     // where suffix i appears. This allows us to quickly find a suffix's position
@@ -223,7 +224,7 @@ fn build_lcp_array(sarray: &[Index], tokens: &[Token]) -> Vec<u32> {
     // Kasai's algorithm exploits the fact that if suffix i has LCP h with its successor,
     // then suffix i+1 has LCP at least h-1 with its successor (this is the key insight
     // that makes the algorithm O(n) instead of O(n²))
-    let mut h: u32 = 0;
+    let mut h: usize = 0;
 
     // Iterate through suffixes in text order (not sorted order)
     for i in 0..sarray.len() {
@@ -239,17 +240,17 @@ fn build_lcp_array(sarray: &[Index], tokens: &[Token]) -> Vec<u32> {
         // Extend the common prefix as far as possible
         // Stop if we reach the end of either suffix, or if tokens differ,
         // or if we encounter an EOL token (0) in either suffix
-        while i + (h as usize) < sarray.len()
-            && j + (h as usize) < sarray.len()
-            && tokens[i + (h as usize)] == tokens[j + (h as usize)]
-            && tokens[i + (h as usize)] != 0
-            && tokens[j + (h as usize)] != 0
+        while i + h < sarray.len()
+            && j + h < sarray.len()
+            && tokens[i + h] == tokens[j + h]
+            && tokens[i + h] != 0
+            && tokens[j + h] != 0
         {
             h += 1;
         }
 
         // Store the LCP value at the position of suffix i in the sorted array
-        lcp[inv_sarray[i] as usize] = h;
+        lcp[inv_sarray[i] as usize] = u8::try_from(h).expect("LCP value exceeded u8::MAX");
 
         // Decrease h by 1 for the next iteration (Kasai's optimization)
         // saturating_sub ensures we don't go below 0
@@ -259,6 +260,13 @@ fn build_lcp_array(sarray: &[Index], tokens: &[Token]) -> Vec<u32> {
     eprintln!("Built LCP array");
     // eprintln!("LCP array: {:?}", lcp);
     lcp
+}
+
+/// Return the largest prefix length stored in an LCP array.
+fn max_lcp_value(lcp: &[u8]) -> u8 {
+    // Empty inputs occur only for degenerate callers, but returning zero keeps
+    // the reporting path total and avoids special cases at the call site.
+    lcp.iter().copied().max().unwrap_or(0)
 }
 
 /// Function signature shared by all n-gram scoring methods.
@@ -449,7 +457,7 @@ fn score_frequency(
 /// interval classes exactly once. It intentionally does not enumerate singleton n-grams.
 fn collect_top_scored_ngrams(
     sarray: &[Index],
-    lcp: &[u32],
+    lcp: &[u8],
     tokens: &[Token],
     token_occurrences: &[usize],
     min_ngram_size: usize,
@@ -620,6 +628,7 @@ fn main() {
     // }
 
     let lcp = build_lcp_array(&sarray, &tokens);
+    eprintln!("Maximum LCP value: {}", max_lcp_value(&lcp));
 
     // for i in 0..sarray.len() {
     //     println!("{} {} {} {}", sarray[i], tokens[sarray[i] as usize],token_decoder[tokens[sarray[i] as usize] as usize], lcp[i]);
@@ -643,8 +652,8 @@ fn main() {
 mod tests {
     use super::{
         Args, RankBy, ScoredNgram, ScoredNgramHeap, build_lcp_array, build_suffix_array,
-        collect_top_scored_ngrams, score_dice, score_frequency, score_mi2, scoring_function_for,
-        sort_scored_ngrams_for_output, tokenize_reader,
+        collect_top_scored_ngrams, max_lcp_value, score_dice, score_frequency, score_mi2,
+        scoring_function_for, sort_scored_ngrams_for_output, tokenize_reader,
     };
     use clap::Parser;
     use std::io::Cursor;
@@ -677,6 +686,12 @@ mod tests {
         assert_eq!(decoder, vec!["<EOL>", "eol"]);
         assert_eq!(tokens, vec![1, 1, 0]);
         assert_eq!(token_occurrences, vec![1, 2]);
+    }
+
+    #[test]
+    fn max_lcp_value_reports_largest_entry() {
+        assert_eq!(max_lcp_value(&[]), 0);
+        assert_eq!(max_lcp_value(&[0, 3, 1, 7, 2]), 7);
     }
 
     #[test]
