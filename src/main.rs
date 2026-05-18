@@ -15,57 +15,116 @@ const DEFAULT_MAX_HEAP_SIZE: usize = 2000;
 const DEFAULT_MIN_COUNT: usize = 10;
 const MIN_POSITIVE_PMI: f64 = 0.1;
 
-/// Convert each unique word to a unique token value.
+/// A consecutive block of TSV rows from the same source tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceSpan {
+    source_id: usize,
+    tag: String,
+    token_start: usize,
+    token_end: usize,
+}
+
+/// Tokenized corpus data plus compact source provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Corpus {
+    tokens: Vec<Token>,
+    token_decoder: Vec<String>,
+    token_occurrences: Vec<usize>,
+    sources: Vec<SourceSpan>,
+}
+
+/// Convert a normalized word to a token, creating a new token when needed.
+fn token_for_word(
+    token_map: &mut HashMap<String, Token>,
+    token_decoder: &mut Vec<String>,
+    word_with_punct: &str,
+) -> Option<Token> {
+    // Check the raw token first so already-normalized entries avoid the
+    // trimming and lowercasing work entirely.
+    if let Some(&token) = token_map.get(word_with_punct) {
+        return Some(token);
+    }
+
+    let trimmed_word =
+        word_with_punct.trim_matches(|c: char| c.is_ascii_punctuation() || c.is_ascii_control());
+
+    if trimmed_word.is_empty() {
+        return None;
+    }
+
+    let normalized_word = trimmed_word.to_lowercase();
+    if let Some(&token) = token_map.get(normalized_word.as_str()) {
+        Some(token)
+    } else {
+        if token_decoder.len() == Token::MAX as usize {
+            panic!("Too many unique tokens (max: {})", Token::MAX);
+        }
+        let new_token = token_decoder.len() as Token;
+        token_map.insert(normalized_word.clone(), new_token);
+        token_decoder.push(normalized_word);
+        Some(new_token)
+    }
+}
+
+/// Convert two-column TSV sentence rows to token IDs and source spans.
 ///
-/// End-of-line (`<EOL>`) is assigned token value 0.
-/// Returns:
-/// - A vector of tokens
-/// - A decoder vector mapping tokens back to words
-/// - A token-occurrence vector where token_occurrences[i] is the number of occurrences of token i
-fn tokenize_reader<R: BufRead>(mut reader: R) -> (Vec<Token>, Vec<String>, Vec<usize>) {
+/// The first TSV column is a source tag, and the second column is the sentence.
+/// End-of-line (`<EOL>`) is assigned token value 0 after every sentence row.
+fn tokenize_tsv_reader<R: BufRead>(mut reader: R) -> Result<Corpus, String> {
     eprintln!("Tokenizing file");
 
     let mut token_map = HashMap::new();
     let mut token_decoder = vec!["<EOL>".to_string()];
     let mut token_occurrences = vec![0usize];
     let mut token_vec = Vec::new();
+    let mut sources: Vec<SourceSpan> = Vec::new();
     let mut line = String::new();
-    let mut line_number = 0usize;
+    let mut line_number = 1usize;
+    let mut current_tag: Option<String> = None;
+    let mut current_source_index: Option<usize> = None;
 
     loop {
         line.clear();
-        let bytes_read = reader.read_line(&mut line).unwrap();
+        let bytes_read = reader
+            .read_line(&mut line)
+            .map_err(|error| format!("Failed to read line {line_number}: {error}"))?;
         if bytes_read == 0 {
             break;
         }
 
-        for word_with_punct in line.split_whitespace() {
-            // Check the raw token first so already-normalized entries avoid the
-            // trimming and lowercasing work entirely.
-            let token = if let Some(&token) = token_map.get(word_with_punct) {
-                token
-            } else {
-                let trimmed_word = word_with_punct
-                    .trim_matches(|c: char| c.is_ascii_punctuation() || c.is_ascii_control());
+        let Some((source_tag, sentence)) = line.split_once('\t') else {
+            return Err(format!(
+                "Malformed TSV row {line_number}: missing tab separator"
+            ));
+        };
+        if source_tag.is_empty() {
+            return Err(format!("Malformed TSV row {line_number}: empty source tag"));
+        }
 
-                if trimmed_word.is_empty() {
-                    continue;
-                }
+        if current_tag.as_deref() != Some(source_tag) {
+            if let Some(source_index) = current_source_index {
+                sources[source_index].token_end = token_vec.len();
+            }
 
-                let normalized_word = trimmed_word.to_lowercase();
-                if let Some(&token) = token_map.get(normalized_word.as_str()) {
-                    token
-                } else {
-                    if token_decoder.len() == Token::MAX as usize {
-                        panic!("Too many unique tokens (max: {})", Token::MAX);
-                    }
-                    let new_token = token_decoder.len() as Token;
-                    token_map.insert(normalized_word.clone(), new_token);
-                    token_decoder.push(normalized_word);
-                    token_occurrences.push(0);
-                    new_token
-                }
+            current_tag = Some(source_tag.to_string());
+            current_source_index = Some(sources.len());
+            sources.push(SourceSpan {
+                source_id: sources.len(),
+                tag: source_tag.to_string(),
+                token_start: token_vec.len(),
+                token_end: token_vec.len(),
+            });
+        }
+
+        for word_with_punct in sentence.split_whitespace() {
+            let Some(token) = token_for_word(&mut token_map, &mut token_decoder, word_with_punct)
+            else {
+                continue;
             };
+
+            if token as usize == token_occurrences.len() {
+                token_occurrences.push(0);
+            }
 
             token_vec.push(token);
             token_occurrences[token as usize] += 1;
@@ -74,10 +133,14 @@ fn tokenize_reader<R: BufRead>(mut reader: R) -> (Vec<Token>, Vec<String>, Vec<u
         token_vec.push(0);
         token_occurrences[0] += 1;
 
-        if line_number.is_multiple_of(1000000) {
+        if (line_number - 1).is_multiple_of(1000000) {
             eprintln!("Processed {} lines", line_number);
         }
         line_number += 1;
+    }
+
+    if let Some(source_index) = current_source_index {
+        sources[source_index].token_end = token_vec.len();
     }
 
     eprintln!(
@@ -87,14 +150,19 @@ fn tokenize_reader<R: BufRead>(mut reader: R) -> (Vec<Token>, Vec<String>, Vec<u
     );
     eprintln!("Counted {} tokens", token_occurrences.len());
 
-    (token_vec, token_decoder, token_occurrences)
+    Ok(Corpus {
+        tokens: token_vec,
+        token_decoder,
+        token_occurrences,
+        sources,
+    })
 }
 
-/// Convert each unique word in a file to a unique token value.
-fn tokenize_file(path: &str) -> (Vec<Token>, Vec<String>, Vec<usize>) {
-    let file = File::open(path).unwrap();
+/// Convert each TSV sentence row in a file to token values and source spans.
+fn tokenize_tsv_file(path: &str) -> Result<Corpus, String> {
+    let file = File::open(path).map_err(|error| format!("Failed to open {path}: {error}"))?;
     let reader = io::BufReader::new(file);
-    tokenize_reader(reader)
+    tokenize_tsv_reader(reader)
 }
 
 /// Ranking methods available for scored n-gram candidates.
@@ -112,7 +180,7 @@ enum RankBy {
 #[derive(Parser)]
 #[command(about = "Text search tool using suffix arrays", version)]
 struct Args {
-    /// Text file to search in
+    /// Two-column TSV file to search in
     #[arg(required = true)]
     file: String,
 
@@ -279,15 +347,38 @@ struct ScoredNgram {
     token_start: Index,
     suffix_index: Index,
     len: Index,
+    left: Index,
+    right: Index,
 }
 
 impl ScoredNgram {
+    #[cfg(test)]
     fn new(score: f64, token_start: Index, suffix_index: Index, len: Index) -> ScoredNgram {
+        ScoredNgram::with_interval(
+            score,
+            token_start,
+            suffix_index,
+            len,
+            suffix_index,
+            suffix_index,
+        )
+    }
+
+    fn with_interval(
+        score: f64,
+        token_start: Index,
+        suffix_index: Index,
+        len: Index,
+        left: Index,
+        right: Index,
+    ) -> ScoredNgram {
         ScoredNgram {
             score: OrderedFloat(score),
             token_start,
             suffix_index,
             len,
+            left,
+            right,
         }
     }
 }
@@ -555,11 +646,13 @@ fn collect_top_scored_ngrams(
                             token_occurrences,
                             corpus_token_count,
                         ) {
-                            best_ngrams.push(ScoredNgram::new(
+                            best_ngrams.push(ScoredNgram::with_interval(
                                 score,
                                 suffix_start as Index,
                                 right as Index,
                                 len as Index,
+                                left as Index,
+                                right as Index,
                             ));
                         }
                     }
@@ -609,12 +702,21 @@ fn main() {
     let args = Args::parse_validated();
     let path = &args.file;
 
-    let (tokens, token_decoder, token_occurrences) = tokenize_file(path);
+    let corpus = match tokenize_tsv_file(path) {
+        Ok(corpus) => corpus,
+        Err(message) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+    };
+    let tokens = &corpus.tokens;
+    let token_decoder = &corpus.token_decoder;
+    let token_occurrences = &corpus.token_occurrences;
     // eprintln!("{:?} tokens", tokens);
     // eprintln!("{:?} token_decoder", token_decoder);
     // eprintln!("Token occurrences: {:?}", token_occurrences);
 
-    let sarray = build_suffix_array(&tokens);
+    let sarray = build_suffix_array(tokens);
 
     // eprintln!("Suffix array: {:?}", sarray);
     // for i in 0..sarray.len() {
@@ -627,7 +729,7 @@ fn main() {
     //     eprintln!("");
     // }
 
-    let lcp = build_lcp_array(&sarray, &tokens);
+    let lcp = build_lcp_array(&sarray, tokens);
     eprintln!("Maximum LCP value: {}", max_lcp_value(&lcp));
 
     // for i in 0..sarray.len() {
@@ -637,15 +739,15 @@ fn main() {
     let scored_ngrams = collect_top_scored_ngrams(
         &sarray,
         &lcp,
-        &tokens,
-        &token_occurrences,
+        tokens,
+        token_occurrences,
         args.min_ngram_size,
         args.max_ngram_size,
         args.max_heap_size,
         args.min_count,
         scoring_function,
     );
-    print_scored_ngrams(&scored_ngrams, &tokens, &token_decoder);
+    print_scored_ngrams(&scored_ngrams, tokens, token_decoder);
 }
 
 #[cfg(test)]
@@ -653,39 +755,85 @@ mod tests {
     use super::{
         Args, RankBy, ScoredNgram, ScoredNgramHeap, build_lcp_array, build_suffix_array,
         collect_top_scored_ngrams, max_lcp_value, score_dice, score_frequency, score_mi2,
-        scoring_function_for, sort_scored_ngrams_for_output, tokenize_reader,
+        scoring_function_for, sort_scored_ngrams_for_output, tokenize_tsv_reader,
     };
     use clap::Parser;
     use std::io::Cursor;
 
     #[test]
     fn tokenizer_trims_and_lowercases_words() {
-        let input = Cursor::new("Huh? don't!\n");
-        let (tokens, decoder, token_occurrences) = tokenize_reader(input);
+        let input = Cursor::new("src\tHuh? don't!\n");
+        let corpus = tokenize_tsv_reader(input).unwrap();
 
-        assert_eq!(decoder, vec!["<EOL>", "huh", "don't"]);
-        assert_eq!(tokens, vec![1, 2, 0]);
-        assert_eq!(token_occurrences, vec![1, 1, 1]);
+        assert_eq!(corpus.token_decoder, vec!["<EOL>", "huh", "don't"]);
+        assert_eq!(corpus.tokens, vec![1, 2, 0]);
+        assert_eq!(corpus.token_occurrences, vec![1, 1, 1]);
     }
 
     #[test]
-    fn tokenizer_preserves_empty_lines_as_eol_tokens() {
-        let input = Cursor::new("Alpha\n\nbeta\n");
-        let (tokens, decoder, token_occurrences) = tokenize_reader(input);
+    fn tokenizer_preserves_empty_sentences_as_eol_tokens() {
+        let input = Cursor::new("src\tAlpha\nsrc\t\nsrc\tbeta\n");
+        let corpus = tokenize_tsv_reader(input).unwrap();
 
-        assert_eq!(decoder, vec!["<EOL>", "alpha", "beta"]);
-        assert_eq!(tokens, vec![1, 0, 0, 2, 0]);
-        assert_eq!(token_occurrences, vec![3, 1, 1]);
+        assert_eq!(corpus.token_decoder, vec!["<EOL>", "alpha", "beta"]);
+        assert_eq!(corpus.tokens, vec![1, 0, 0, 2, 0]);
+        assert_eq!(corpus.token_occurrences, vec![3, 1, 1]);
     }
 
     #[test]
     fn tokenizer_keeps_literal_eol_text_distinct_from_eol_tokens() {
-        let input = Cursor::new("<EOL> <EOL>\n");
-        let (tokens, decoder, token_occurrences) = tokenize_reader(input);
+        let input = Cursor::new("src\t<EOL> <EOL>\n");
+        let corpus = tokenize_tsv_reader(input).unwrap();
 
-        assert_eq!(decoder, vec!["<EOL>", "eol"]);
-        assert_eq!(tokens, vec![1, 1, 0]);
-        assert_eq!(token_occurrences, vec![1, 2]);
+        assert_eq!(corpus.token_decoder, vec!["<EOL>", "eol"]);
+        assert_eq!(corpus.tokens, vec![1, 1, 0]);
+        assert_eq!(corpus.token_occurrences, vec![1, 2]);
+    }
+
+    #[test]
+    fn tokenizer_ignores_source_tag_words() {
+        let input = Cursor::new("tagword\tSentence only\n");
+        let corpus = tokenize_tsv_reader(input).unwrap();
+
+        assert_eq!(corpus.token_decoder, vec!["<EOL>", "sentence", "only"]);
+        assert_eq!(corpus.tokens, vec![1, 2, 0]);
+        assert_eq!(corpus.token_occurrences, vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn tokenizer_records_zero_based_source_spans_for_tag_changes() {
+        let input = Cursor::new("a\tone two\na\tthree\nb\tfour\nb\tfive six\na\tseven\n");
+        let corpus = tokenize_tsv_reader(input).unwrap();
+
+        assert_eq!(corpus.sources.len(), 3);
+        assert_eq!(corpus.sources[0].source_id, 0);
+        assert_eq!(corpus.sources[0].tag, "a");
+        assert_eq!(corpus.sources[0].token_start, 0);
+        assert_eq!(corpus.sources[0].token_end, 5);
+        assert_eq!(corpus.sources[1].source_id, 1);
+        assert_eq!(corpus.sources[1].tag, "b");
+        assert_eq!(corpus.sources[1].token_start, 5);
+        assert_eq!(corpus.sources[1].token_end, 10);
+        assert_eq!(corpus.sources[2].source_id, 2);
+        assert_eq!(corpus.sources[2].tag, "a");
+        assert_eq!(corpus.sources[2].token_start, 10);
+        assert_eq!(corpus.sources[2].token_end, 12);
+    }
+
+    #[test]
+    fn tokenizer_rejects_missing_tab_with_line_number() {
+        let input = Cursor::new("src\tok\nbad row\n");
+        let error = tokenize_tsv_reader(input).unwrap_err();
+
+        assert_eq!(error, "Malformed TSV row 2: missing tab separator");
+    }
+
+    #[test]
+    fn tokenizer_rejects_empty_source_tag_with_line_number() {
+        let input = Cursor::new("src\tok\n\tbad\n");
+        let error = tokenize_tsv_reader(input).unwrap_err();
+
+        assert_eq!(error, "Malformed TSV row 2: empty source tag");
     }
 
     #[test]
@@ -873,23 +1021,23 @@ mod tests {
     fn selected_frequency_ranking_keeps_low_pmi_candidates() {
         let mut corpus = String::new();
         for _ in 0..10 {
-            corpus.push_str("a b\n");
+            corpus.push_str("src\ta b\n");
         }
         for _ in 0..90 {
-            corpus.push_str("a c\n");
+            corpus.push_str("src\ta c\n");
         }
         for _ in 0..90 {
-            corpus.push_str("d b\n");
+            corpus.push_str("src\td b\n");
         }
 
-        let (tokens, _decoder, token_occurrences) = tokenize_reader(Cursor::new(corpus));
-        let sarray = build_suffix_array(&tokens);
-        let lcp = build_lcp_array(&sarray, &tokens);
+        let corpus = tokenize_tsv_reader(Cursor::new(corpus)).unwrap();
+        let sarray = build_suffix_array(&corpus.tokens);
+        let lcp = build_lcp_array(&sarray, &corpus.tokens);
         let scored_ngrams = collect_top_scored_ngrams(
             &sarray,
             &lcp,
-            &tokens,
-            &token_occurrences,
+            &corpus.tokens,
+            &corpus.token_occurrences,
             2,
             2,
             2000,
@@ -899,22 +1047,23 @@ mod tests {
 
         assert!(scored_ngrams.iter().any(|scored_ngram| {
             scored_ngram.score.0 == 10.0
-                && tokens[scored_ngram.token_start as usize..scored_ngram.token_start as usize + 2]
+                && corpus.tokens
+                    [scored_ngram.token_start as usize..scored_ngram.token_start as usize + 2]
                     == [1, 2]
         }));
     }
 
     #[test]
     fn stack_enumeration_scores_repeated_ngram_once() {
-        let corpus = "a b\nx a b\n";
-        let (tokens, _decoder, token_occurrences) = tokenize_reader(Cursor::new(corpus));
-        let sarray = build_suffix_array(&tokens);
-        let lcp = build_lcp_array(&sarray, &tokens);
+        let corpus = "src\ta b\nsrc\tx a b\n";
+        let corpus = tokenize_tsv_reader(Cursor::new(corpus)).unwrap();
+        let sarray = build_suffix_array(&corpus.tokens);
+        let lcp = build_lcp_array(&sarray, &corpus.tokens);
         let scored_ngrams = collect_top_scored_ngrams(
             &sarray,
             &lcp,
-            &tokens,
-            &token_occurrences,
+            &corpus.tokens,
+            &corpus.token_occurrences,
             2,
             2,
             2000,
@@ -926,7 +1075,7 @@ mod tests {
             .iter()
             .filter(|scored_ngram| {
                 let token_start = scored_ngram.token_start as usize;
-                scored_ngram.score.0 == 2.0 && tokens[token_start..token_start + 2] == [1, 2]
+                scored_ngram.score.0 == 2.0 && corpus.tokens[token_start..token_start + 2] == [1, 2]
             })
             .collect();
 
@@ -934,16 +1083,53 @@ mod tests {
     }
 
     #[test]
-    fn stack_enumeration_skips_singletons() {
-        let corpus = "a b\nc d\n";
-        let (tokens, _decoder, token_occurrences) = tokenize_reader(Cursor::new(corpus));
-        let sarray = build_suffix_array(&tokens);
-        let lcp = build_lcp_array(&sarray, &tokens);
+    fn stack_enumeration_keeps_suffix_interval_bounds() {
+        let corpus = "src\ta b\nsrc\tx a b\n";
+        let corpus = tokenize_tsv_reader(Cursor::new(corpus)).unwrap();
+        let sarray = build_suffix_array(&corpus.tokens);
+        let lcp = build_lcp_array(&sarray, &corpus.tokens);
         let scored_ngrams = collect_top_scored_ngrams(
             &sarray,
             &lcp,
-            &tokens,
-            &token_occurrences,
+            &corpus.tokens,
+            &corpus.token_occurrences,
+            2,
+            2,
+            2000,
+            2,
+            scoring_function_for(RankBy::Frequency),
+        );
+
+        let repeated_bigram = scored_ngrams
+            .iter()
+            .find(|scored_ngram| {
+                let token_start = scored_ngram.token_start as usize;
+                corpus.tokens[token_start..token_start + 2] == [1, 2]
+            })
+            .unwrap();
+        let left = repeated_bigram.left as usize;
+        let right = repeated_bigram.right as usize;
+        let mut occurrence_starts: Vec<usize> = sarray[left..=right]
+            .iter()
+            .map(|&token_start| token_start as usize)
+            .collect();
+        occurrence_starts.sort_unstable();
+
+        assert_eq!(right - left + 1, 2);
+        assert_eq!(occurrence_starts, vec![0, 4]);
+    }
+
+    #[test]
+    fn stack_enumeration_skips_singletons() {
+        let corpus = "src\ta b\nsrc\tc d\n";
+        let corpus = tokenize_tsv_reader(Cursor::new(corpus)).unwrap();
+        let sarray = build_suffix_array(&corpus.tokens);
+        let lcp = build_lcp_array(&sarray, &corpus.tokens);
+        let scored_ngrams = collect_top_scored_ngrams(
+            &sarray,
+            &lcp,
+            &corpus.tokens,
+            &corpus.token_occurrences,
             2,
             2,
             2000,
