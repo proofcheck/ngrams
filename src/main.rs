@@ -13,6 +13,7 @@ const DEFAULT_MIN_NGRAM_SIZE: usize = 2;
 const DEFAULT_MAX_NGRAM_SIZE: usize = 15;
 const DEFAULT_MAX_HEAP_SIZE: usize = 2000;
 const DEFAULT_MIN_COUNT: usize = 10;
+const DEFAULT_MAX_SOURCE_TAGS: usize = 0;
 const MIN_POSITIVE_PMI: f64 = 0.1;
 
 /// A consecutive block of TSV rows from the same source tag.
@@ -206,6 +207,10 @@ struct Args {
     /// Minimum repeated n-gram occurrence count to score; must be at least 2
     #[arg(short = 'c', long, default_value_t = DEFAULT_MIN_COUNT)]
     min_count: usize,
+
+    /// Maximum number of source tags to print for each n-gram; 0 disables source output
+    #[arg(short = 's', long, default_value_t = DEFAULT_MAX_SOURCE_TAGS)]
+    max_source_tags: usize,
 }
 
 impl Args {
@@ -721,17 +726,99 @@ fn collect_top_scored_ngrams(
     scored_ngrams
 }
 
+/// Find the source span containing a token position.
+fn source_index_for_token(sources: &[SourceSpan], token_start: usize) -> Option<usize> {
+    let source_index = sources.partition_point(|source| source.token_start <= token_start);
+    let source_index = source_index.checked_sub(1)?;
+    let source = &sources[source_index];
+
+    (token_start < source.token_end).then_some(source_index)
+}
+
+/// Return up to `max_source_tags` source tags for an n-gram occurrence interval.
+fn source_tags_for_ngram<'a>(
+    scored_ngram: &ScoredNgram,
+    sarray: &[Index],
+    sources: &'a [SourceSpan],
+    max_source_tags: usize,
+) -> Vec<&'a str> {
+    if max_source_tags == 0 {
+        return Vec::new();
+    }
+
+    let mut source_tags = Vec::new();
+    let mut seen_source_ids = Vec::new();
+    let left = scored_ngram.left as usize;
+    let right = scored_ngram.right as usize;
+
+    for &token_start in &sarray[left..=right] {
+        let Some(source_index) = source_index_for_token(sources, token_start as usize) else {
+            continue;
+        };
+        let source = &sources[source_index];
+
+        if seen_source_ids.contains(&source.source_id) {
+            continue;
+        }
+
+        seen_source_ids.push(source.source_id);
+        source_tags.push(source.tag.as_str());
+        if source_tags.len() == max_source_tags {
+            break;
+        }
+    }
+
+    source_tags
+}
+
+/// Render one scored n-gram line.
+fn format_scored_ngram(
+    scored_ngram: &ScoredNgram,
+    tokens: &[Token],
+    token_decoder: &[String],
+    sarray: &[Index],
+    sources: &[SourceSpan],
+    max_source_tags: usize,
+) -> String {
+    let suffix_start = scored_ngram.token_start as usize;
+    let suffix_len = scored_ngram.len as usize;
+    let ngram_tokens = &tokens[suffix_start..suffix_start + suffix_len];
+    let words: Vec<&str> = ngram_tokens
+        .iter()
+        .map(|&t| token_decoder[t as usize].as_str())
+        .collect();
+    let mut line = format!("{} ({})", words.join(" "), scored_ngram.score.0);
+
+    if max_source_tags > 0 {
+        let source_tags =
+            source_tags_for_ngram(scored_ngram, sarray, sources, max_source_tags).join(", ");
+        line.push_str(format!("\t[{source_tags}]").as_str());
+    }
+
+    line
+}
+
 /// Print scored n-grams in their already-ranked order.
-fn print_scored_ngrams(scored_ngrams: &[ScoredNgram], tokens: &[Token], token_decoder: &[String]) {
+fn print_scored_ngrams(
+    scored_ngrams: &[ScoredNgram],
+    tokens: &[Token],
+    token_decoder: &[String],
+    sarray: &[Index],
+    sources: &[SourceSpan],
+    max_source_tags: usize,
+) {
     for scored_ngram in scored_ngrams {
-        let suffix_start = scored_ngram.token_start as usize;
-        let suffix_len = scored_ngram.len as usize;
-        let ngram_tokens = &tokens[suffix_start..suffix_start + suffix_len];
-        let words: Vec<&str> = ngram_tokens
-            .iter()
-            .map(|&t| token_decoder[t as usize].as_str())
-            .collect();
-        println!("{} ({})", words.join(" "), scored_ngram.score.0);
+        println!(
+            "{}",
+            format_scored_ngram(
+                scored_ngram,
+                tokens,
+                token_decoder,
+                sarray,
+                sources,
+                max_source_tags
+            )
+        );
     }
 }
 
@@ -783,15 +870,23 @@ fn main() {
         args.min_count,
         args.rank_by,
     );
-    print_scored_ngrams(&scored_ngrams, tokens, token_decoder);
+    print_scored_ngrams(
+        &scored_ngrams,
+        tokens,
+        token_decoder,
+        &sarray,
+        &corpus.sources,
+        args.max_source_tags,
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, RankBy, ScoredNgram, ScoredNgramHeap, build_lcp_array, build_suffix_array,
-        collect_top_scored_ngrams, max_lcp_value, score_dice, score_frequency, score_length,
-        score_mi2, sort_scored_ngrams_for_output, tokenize_tsv_reader,
+        Args, RankBy, ScoredNgram, ScoredNgramHeap, SourceSpan, build_lcp_array,
+        build_suffix_array, collect_top_scored_ngrams, format_scored_ngram, max_lcp_value,
+        score_dice, score_frequency, score_length, score_mi2, sort_scored_ngrams_for_output,
+        source_tags_for_ngram, tokenize_tsv_reader,
     };
     use clap::Parser;
     use std::io::Cursor;
@@ -911,6 +1006,75 @@ mod tests {
     }
 
     #[test]
+    fn source_tags_for_ngram_limits_unique_sources() {
+        let scored_ngram = ScoredNgram::with_interval(2.0, 0, 3, 2, 0, 3);
+        let sarray = vec![0, 3, 6, 9];
+        let sources = vec![
+            SourceSpan {
+                source_id: 0,
+                tag: "src-a".to_string(),
+                token_start: 0,
+                token_end: 6,
+            },
+            SourceSpan {
+                source_id: 1,
+                tag: "src-b".to_string(),
+                token_start: 6,
+                token_end: 9,
+            },
+            SourceSpan {
+                source_id: 2,
+                tag: "src-c".to_string(),
+                token_start: 9,
+                token_end: 12,
+            },
+        ];
+
+        assert_eq!(
+            source_tags_for_ngram(&scored_ngram, &sarray, &sources, 2),
+            vec!["src-a", "src-b"]
+        );
+    }
+
+    #[test]
+    fn format_scored_ngram_omits_source_tags_by_default() {
+        let scored_ngram = ScoredNgram::with_interval(2.0, 0, 0, 2, 0, 0);
+        let tokens = vec![1, 2, 0];
+        let token_decoder = vec!["<EOL>".to_string(), "a".to_string(), "b".to_string()];
+        let sarray = vec![0];
+        let sources = vec![SourceSpan {
+            source_id: 0,
+            tag: "src-a".to_string(),
+            token_start: 0,
+            token_end: 3,
+        }];
+
+        assert_eq!(
+            format_scored_ngram(&scored_ngram, &tokens, &token_decoder, &sarray, &sources, 0),
+            "a b (2)"
+        );
+    }
+
+    #[test]
+    fn format_scored_ngram_appends_source_tags_when_requested() {
+        let scored_ngram = ScoredNgram::with_interval(2.0, 0, 0, 2, 0, 0);
+        let tokens = vec![1, 2, 0];
+        let token_decoder = vec!["<EOL>".to_string(), "a".to_string(), "b".to_string()];
+        let sarray = vec![0];
+        let sources = vec![SourceSpan {
+            source_id: 0,
+            tag: "src-a".to_string(),
+            token_start: 0,
+            token_end: 3,
+        }];
+
+        assert_eq!(
+            format_scored_ngram(&scored_ngram, &tokens, &token_decoder, &sarray, &sources, 1),
+            "a b (2)\t[src-a]"
+        );
+    }
+
+    #[test]
     fn args_parse_rank_and_size_bounds() {
         let args = Args::try_parse_from([
             "ngrams",
@@ -924,6 +1088,8 @@ mod tests {
             "123",
             "--min-count",
             "4",
+            "--max-source-tags",
+            "2",
             "input.txt",
         ])
         .unwrap();
@@ -933,6 +1099,7 @@ mod tests {
         assert_eq!(args.max_ngram_size, 7);
         assert_eq!(args.max_heap_size, 123);
         assert_eq!(args.min_count, 4);
+        assert_eq!(args.max_source_tags, 2);
         assert!(args.validate().is_ok());
     }
 
