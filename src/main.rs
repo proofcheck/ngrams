@@ -174,6 +174,9 @@ enum RankBy {
     Dice,
     /// Rank n-grams by their raw occurrence count.
     Frequency,
+    /// Rank n-grams by their token length.
+    #[value(alias = "longest")]
+    Length,
 }
 
 /// Command line arguments for the n-gram ranking tool.
@@ -464,6 +467,22 @@ fn scoring_function_for(rank_by: RankBy) -> ScoringFunction {
         RankBy::Mi2 => score_mi2,
         RankBy::Dice => score_dice,
         RankBy::Frequency => score_frequency,
+        RankBy::Length => score_length,
+    }
+}
+
+/// Return whether an interval can emit only its longest owned n-gram.
+fn rank_uses_longest_owned_length_only(rank_by: RankBy) -> bool {
+    match rank_by {
+        // Every owned length in a suffix-array interval has the same frequency,
+        // and output tie-breaks prefer the longest n-gram.
+        RankBy::Frequency | RankBy::Length => true,
+        // For MI2, extending a same-count n-gram by token x changes PMI by
+        // ln(corpus_token_count / token_occurrences[x]), which is nonnegative.
+        // Since MI2 scores only positive-PMI candidates, the score cannot
+        // decrease inside one same-count interval.
+        RankBy::Mi2 => true,
+        RankBy::Dice => false,
     }
 }
 
@@ -542,6 +561,16 @@ fn score_frequency(
     Some(ngram_occurrences as f64)
 }
 
+/// Score an n-gram by its token length.
+fn score_length(
+    ngram_tokens: &[Token],
+    _ngram_occurrences: usize,
+    _token_occurrences: &[usize],
+    _corpus_token_count: usize,
+) -> Option<f64> {
+    Some(ngram_tokens.len() as f64)
+}
+
 /// Enumerate repeated n-gram candidates, score them, and retain the best matches.
 ///
 /// This function uses a monotone stack over the LCP array to emit repeated suffix-array
@@ -555,7 +584,7 @@ fn collect_top_scored_ngrams(
     max_ngram_size: usize,
     max_heap_size: usize,
     min_count: usize,
-    scoring_function: ScoringFunction,
+    rank_by: RankBy,
 ) -> Vec<ScoredNgram> {
     eprintln!("Scoring ngrams");
 
@@ -570,6 +599,8 @@ fn collect_top_scored_ngrams(
     // best_ngrams owns the ranking policy: either retain every scored candidate
     // or retain only the highest-scoring fixed-size heap.
     let mut best_ngrams = ScoredNgramHeap::new(max_heap_size);
+    let scoring_function = scoring_function_for(rank_by);
+    let longest_owned_length_only = rank_uses_longest_owned_length_only(rank_by);
 
     // stack stores active LCP intervals as (left, prefix_len).
     //
@@ -635,7 +666,13 @@ fn collect_top_scored_ngrams(
                     // representative suffix at the interval's right endpoint.
                     let suffix_start = sarray[right] as usize;
 
-                    for len in first_len..=last_len {
+                    let first_emitted_len = if longest_owned_length_only {
+                        last_len
+                    } else {
+                        first_len
+                    };
+
+                    for len in first_emitted_len..=last_len {
                         // ngram_tokens is valid without an EOL check because
                         // LCP construction stops before crossing EOL.
                         let ngram_tokens = &tokens[suffix_start..suffix_start + len];
@@ -735,7 +772,6 @@ fn main() {
     // for i in 0..sarray.len() {
     //     println!("{} {} {} {}", sarray[i], tokens[sarray[i] as usize],token_decoder[tokens[sarray[i] as usize] as usize], lcp[i]);
     // }
-    let scoring_function = scoring_function_for(args.rank_by);
     let scored_ngrams = collect_top_scored_ngrams(
         &sarray,
         &lcp,
@@ -745,7 +781,7 @@ fn main() {
         args.max_ngram_size,
         args.max_heap_size,
         args.min_count,
-        scoring_function,
+        args.rank_by,
     );
     print_scored_ngrams(&scored_ngrams, tokens, token_decoder);
 }
@@ -754,8 +790,8 @@ fn main() {
 mod tests {
     use super::{
         Args, RankBy, ScoredNgram, ScoredNgramHeap, build_lcp_array, build_suffix_array,
-        collect_top_scored_ngrams, max_lcp_value, score_dice, score_frequency, score_mi2,
-        scoring_function_for, sort_scored_ngrams_for_output, tokenize_tsv_reader,
+        collect_top_scored_ngrams, max_lcp_value, score_dice, score_frequency, score_length,
+        score_mi2, sort_scored_ngrams_for_output, tokenize_tsv_reader,
     };
     use clap::Parser;
     use std::io::Cursor;
@@ -879,7 +915,7 @@ mod tests {
         let args = Args::try_parse_from([
             "ngrams",
             "--rank-by",
-            "dice",
+            "length",
             "--min-ngram-size",
             "3",
             "--max-ngram-size",
@@ -892,7 +928,7 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(args.rank_by, RankBy::Dice);
+        assert_eq!(args.rank_by, RankBy::Length);
         assert_eq!(args.min_ngram_size, 3);
         assert_eq!(args.max_ngram_size, 7);
         assert_eq!(args.max_heap_size, 123);
@@ -988,6 +1024,15 @@ mod tests {
             ),
             Some(2.0)
         );
+        assert_eq!(
+            score_length(
+                &ngram_tokens,
+                ngram_occurrences,
+                &token_occurrences,
+                corpus_token_count
+            ),
+            Some(2.0)
+        );
     }
 
     #[test]
@@ -1042,7 +1087,7 @@ mod tests {
             2,
             2000,
             10,
-            scoring_function_for(RankBy::Frequency),
+            RankBy::Frequency,
         );
 
         assert!(scored_ngrams.iter().any(|scored_ngram| {
@@ -1051,6 +1096,96 @@ mod tests {
                     [scored_ngram.token_start as usize..scored_ngram.token_start as usize + 2]
                     == [1, 2]
         }));
+    }
+
+    #[test]
+    fn frequency_ranking_emits_only_longest_owned_length_per_interval() {
+        let corpus = "src\ta b c\nsrc\ta b c\n";
+        let corpus = tokenize_tsv_reader(Cursor::new(corpus)).unwrap();
+        let sarray = build_suffix_array(&corpus.tokens);
+        let lcp = build_lcp_array(&sarray, &corpus.tokens);
+        let scored_ngrams = collect_top_scored_ngrams(
+            &sarray,
+            &lcp,
+            &corpus.tokens,
+            &corpus.token_occurrences,
+            2,
+            3,
+            0,
+            2,
+            RankBy::Frequency,
+        );
+
+        let emitted: Vec<Vec<_>> = scored_ngrams
+            .iter()
+            .map(|scored_ngram| {
+                let token_start = scored_ngram.token_start as usize;
+                let token_end = token_start + scored_ngram.len as usize;
+                corpus.tokens[token_start..token_end].to_vec()
+            })
+            .collect();
+
+        assert!(emitted.contains(&vec![1, 2, 3]));
+        assert!(emitted.contains(&vec![2, 3]));
+        assert!(!emitted.contains(&vec![1, 2]));
+    }
+
+    #[test]
+    fn mi2_ranking_emits_only_longest_owned_length_per_interval() {
+        let corpus = "src\ta b c\nsrc\ta b c\nsrc\td e f\n";
+        let corpus = tokenize_tsv_reader(Cursor::new(corpus)).unwrap();
+        let sarray = build_suffix_array(&corpus.tokens);
+        let lcp = build_lcp_array(&sarray, &corpus.tokens);
+        let scored_ngrams = collect_top_scored_ngrams(
+            &sarray,
+            &lcp,
+            &corpus.tokens,
+            &corpus.token_occurrences,
+            2,
+            3,
+            0,
+            2,
+            RankBy::Mi2,
+        );
+
+        let emitted: Vec<Vec<_>> = scored_ngrams
+            .iter()
+            .map(|scored_ngram| {
+                let token_start = scored_ngram.token_start as usize;
+                let token_end = token_start + scored_ngram.len as usize;
+                corpus.tokens[token_start..token_end].to_vec()
+            })
+            .collect();
+
+        assert!(emitted.contains(&vec![1, 2, 3]));
+        assert!(emitted.contains(&vec![2, 3]));
+        assert!(!emitted.contains(&vec![1, 2]));
+    }
+
+    #[test]
+    fn length_ranking_finds_longest_repeated_ngram() {
+        let corpus = "src\ta b c\nsrc\tx y\nsrc\ta b c\nsrc\tx y\n";
+        let corpus = tokenize_tsv_reader(Cursor::new(corpus)).unwrap();
+        let sarray = build_suffix_array(&corpus.tokens);
+        let lcp = build_lcp_array(&sarray, &corpus.tokens);
+        let scored_ngrams = collect_top_scored_ngrams(
+            &sarray,
+            &lcp,
+            &corpus.tokens,
+            &corpus.token_occurrences,
+            1,
+            3,
+            1,
+            2,
+            RankBy::Length,
+        );
+
+        let longest = scored_ngrams.first().unwrap();
+        let token_start = longest.token_start as usize;
+        let token_end = token_start + longest.len as usize;
+
+        assert_eq!(longest.score.0, 3.0);
+        assert_eq!(corpus.tokens[token_start..token_end], [1, 2, 3]);
     }
 
     #[test]
@@ -1068,7 +1203,7 @@ mod tests {
             2,
             2000,
             2,
-            scoring_function_for(RankBy::Frequency),
+            RankBy::Frequency,
         );
 
         let repeated_bigrams: Vec<&ScoredNgram> = scored_ngrams
@@ -1097,7 +1232,7 @@ mod tests {
             2,
             2000,
             2,
-            scoring_function_for(RankBy::Frequency),
+            RankBy::Frequency,
         );
 
         let repeated_bigram = scored_ngrams
@@ -1134,7 +1269,7 @@ mod tests {
             2,
             2000,
             2,
-            scoring_function_for(RankBy::Frequency),
+            RankBy::Frequency,
         );
 
         assert!(scored_ngrams.is_empty());
